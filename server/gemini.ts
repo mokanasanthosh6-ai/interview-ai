@@ -8,8 +8,9 @@ import type {
   QuestionSubmission,
 } from '../src/types/interview.ts';
 
-const PRIMARY_MODEL = 'gemini-4-hydrogen';
-const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
+const FALLBACK_MODEL = 'gemini-4-hydrogen';
+const REQUEST_TIMEOUT_MS = 25000;
 
 let cachedClient: GoogleGenAI | null = null;
 let cachedApiKey: string | undefined;
@@ -19,7 +20,7 @@ function getGeminiClient(): GoogleGenAI {
 
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new GeminiServiceError(
-      'Gemini API key is not configured. Please add GEMINI_API_KEY in Settings > Secrets and restart the server.',
+      'Gemini API key is not configured. Please add GEMINI_API_KEY in Settings > Secrets (or Vercel Environment Variables) and redeploy.',
       500,
     );
   }
@@ -55,7 +56,8 @@ function isUnavailableError(rawMessage: string): boolean {
     lower.includes('503') ||
     lower.includes('unavailable') ||
     lower.includes('high demand') ||
-    lower.includes('overloaded')
+    lower.includes('overloaded') ||
+    lower.includes('timed out')
   );
 }
 
@@ -69,14 +71,14 @@ function mapGeminiError(error: unknown): GeminiServiceError {
 
   if (lower.includes('api_key_invalid') || lower.includes('permission_denied') || lower.includes('403') || lower.includes('401')) {
     return new GeminiServiceError(
-      'Your Gemini API key appears invalid or lacks permission. Please verify GEMINI_API_KEY in Settings > Secrets.',
+      'Your Gemini API key appears invalid or lacks permission. Please verify GEMINI_API_KEY in your environment settings.',
       403,
     );
   }
 
   if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
     return new GeminiServiceError(
-      'Gemini API rate limit or quota exceeded. Please wait a moment and try again, or check your quota in Settings > Secrets.',
+      'Gemini API rate limit or quota exceeded. Please wait a moment and try again, or check your quota.',
       429,
     );
   }
@@ -101,17 +103,46 @@ function mapGeminiError(error: unknown): GeminiServiceError {
   );
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Gemini request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function getThinkingLevelForModel(modelName: string): ThinkingLevel {
+  return modelName === 'gemini-3.1-flash-lite'
+    ? ThinkingLevel.MINIMAL
+    : ThinkingLevel.LOW;
+}
+
 async function runWithModelRetry<T>(
-  operation: (modelName: string) => Promise<T>,
+  operation: (modelName: string, thinkingLevel: ThinkingLevel) => Promise<T>,
   maxRetriesPerModel = 1,
 ): Promise<T> {
   const models = [PRIMARY_MODEL, FALLBACK_MODEL];
   let lastError: unknown;
 
   for (const modelName of models) {
+    const thinkingLevel = getThinkingLevelForModel(modelName);
     for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
       try {
-        return await operation(modelName);
+        return await withTimeout(
+          operation(modelName, thinkingLevel),
+          REQUEST_TIMEOUT_MS,
+        );
       } catch (error) {
         lastError = error;
         if (error instanceof GeminiServiceError && error.statusCode < 500 && error.statusCode !== 429) {
@@ -128,14 +159,12 @@ async function runWithModelRetry<T>(
           throw mapGeminiError(error);
         }
 
-        // Immediately switch to fallback model if primary returns 503 UNAVAILABLE
         if (modelName === PRIMARY_MODEL && isUnavailableError(message)) {
           break;
         }
 
         if (attempt < maxRetriesPerModel) {
-          const delayMs = 700 * Math.pow(2, attempt);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          await new Promise((resolve) => setTimeout(resolve, 400));
         }
       }
     }
@@ -184,14 +213,14 @@ Requirements:
 5. Ensure all 5 questions cover distinct topics with zero duplicates or repetitive phrasing.
 6. Write clear, conversational interviewer questions suitable for a written mock interview response.`;
 
-  return runWithModelRetry(async (modelName) => {
+  return runWithModelRetry(async (modelName, thinkingLevel) => {
     const response = await ai.models.generateContent({
       model: modelName,
       contents: prompt,
       config: {
         systemInstruction:
           'You are a senior technical interviewer and career coach. Generate structured, realistic, unambiguous mock interview questions strictly adhering to the requested JSON schema.',
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        thinkingConfig: { thinkingLevel },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -303,14 +332,14 @@ Scoring & Evaluation Rubric:
 - In "scoreReasoning", explicitly explain why this exact numerical score was assigned based on technical accuracy, relevance, clarity, and completeness.
 - In "sampleImprovedAnswer", write a realistic, well-structured improved answer suitable for a ${params.experienceLevel} candidate. CRITICAL: Do NOT invent fake past companies, fake years of experience, or fabricated achievements; use natural phrasing or placeholders like "[a recent project]" if referencing personal experience.`;
 
-  return runWithModelRetry(async (modelName) => {
+  return runWithModelRetry(async (modelName, thinkingLevel) => {
     const response = await ai.models.generateContent({
       model: modelName,
       contents: prompt,
       config: {
         systemInstruction:
           'You are an objective, fair, and encouraging technical & HR interview evaluator. Never inflate scores for off-topic, vague, or low-effort answers. Never fabricate candidate achievements in sample answers. Output strictly valid JSON matching the schema.',
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        thinkingConfig: { thinkingLevel },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -436,14 +465,14 @@ Generate:
 3. areasForImprovement: 3-4 specific technical or communication gaps observed in their answers.
 4. futureRecommendations: 4-5 actionable, practical next steps for preparing for upcoming ${params.jobRole} (${params.experienceLevel}) interviews.`;
 
-  return runWithModelRetry(async (modelName) => {
+  return runWithModelRetry(async (modelName, thinkingLevel) => {
     const response = await ai.models.generateContent({
       model: modelName,
       contents: prompt,
       config: {
         systemInstruction:
           'You are a constructive career coach writing a personalized final mock interview report based strictly on the verified question-and-answer transcript. Be honest, specific, and supportive. Output strictly valid JSON matching the schema.',
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        thinkingConfig: { thinkingLevel },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,

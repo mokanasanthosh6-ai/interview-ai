@@ -12,6 +12,11 @@ async function parseApiResponse<T>(response: Response): Promise<T> {
   try {
     payload = await response.json();
   } catch {
+    if (response.status === 504) {
+      throw new Error(
+        'The AI request timed out on the server (HTTP 504). Please try again in a moment.',
+      );
+    }
     throw new Error(`Server returned an unexpected response (HTTP ${response.status}).`);
   }
 
