@@ -1,0 +1,6 @@
+{
+  "name": "InterviewMate AI – Your Personal AI Interview Coach",
+  "description": "An AI-powered mock interview platform powered by Google Gemini that generates role-specific technical and HR questions, evaluates answers with structured scoring and feedback, and produces a personalized final interview report.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
